@@ -296,8 +296,10 @@ class System:
         s["mem_total"] = mem.get("MemTotal", 0)
         s["mem_used"] = mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)
         s["mem_cached"] = mem.get("Cached", 0)
+        s["mem_free"] = mem.get("MemFree", 0)
         s["swap_used"] = mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)
         s["llama_rss"] = self._llama_rss()
+        s["llama_vram"], s["llama_gtt"] = self._llama_gpu_memory()
 
         g = self.gpu_dev
         if g:
@@ -335,6 +337,28 @@ class System:
             if line.endswith("*"):
                 return line.split()[1]
         return ""
+
+    @staticmethod
+    def _llama_gpu_memory() -> tuple[int, int]:
+        """VRAM and GTT held by llama-server, from DRM fdinfo (needs root or
+        the server's user); one count per DRM client."""
+        seen: dict[str, tuple[int, int]] = {}
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                if (proc / "comm").read_text().strip() != "llama-server":
+                    continue
+                for fd in (proc / "fdinfo").iterdir():
+                    info = {}
+                    for line in fd.read_text().splitlines():
+                        key, _, value = line.partition(":")
+                        info[key] = value.strip()
+                    if "drm-client-id" not in info:
+                        continue
+                    kib = lambda k: int(info.get(k, "0 KiB").split()[0]) * 1024
+                    seen[info["drm-client-id"]] = (kib("drm-memory-vram"), kib("drm-memory-gtt"))
+            except (OSError, ValueError):
+                continue
+        return sum(v for v, _ in seen.values()), sum(g for _, g in seen.values())
 
     @staticmethod
     def _llama_rss() -> int:
@@ -653,7 +677,14 @@ class Ui:
         slots_n = st.props.get("total_slots") or preset.get("parallel", "-")
         kv = f"{preset.get('cache-type-k', 'f16')}/{preset.get('cache-type-v', 'f16')}"
         layers = st.facts.get("layers", "").replace("/", " of ")
-        place = f"GPU layers {layers}" if layers else "GPU layers -"
+        sysd = st.system
+        if layers:
+            place = f"GPU layers {layers}"
+        else:
+            place = "automatic (--fit, 1 GiB VRAM spare)"
+        if sysd.get("llama_vram"):
+            place += (f" · {human_bytes(sysd['llama_vram'])} VRAM + {human_bytes(sysd.get('llama_gtt', 0))} GTT"
+                      f" · {human_bytes(sysd.get('llama_rss', 0))} resident in RAM")
         if st.facts.get("n_cpu_moe"):
             place += f" · experts of {st.facts['n_cpu_moe']} layers on CPU"
         if st.facts.get("gpu_buf"):
@@ -750,10 +781,12 @@ class Ui:
         self.put(y + 1, 8 + bw, cpu_text, self.c(self.TEXT))
         total = s.get("mem_total", 1) or 1
         self.put(y + 2, 2, "RAM", self.c(self.MUTED))
-        self.bar(y + 2, 7, bw, s.get("mem_used", 0) / total, self.AMBER)
-        self.put(y + 2, 8 + bw, f"{human_bytes(s.get('mem_used', 0))} of {human_bytes(total)}"
-                 f"  llama-server {human_bytes(s.get('llama_rss', 0))}"
-                 f"  page cache {human_bytes(s.get('mem_cached', 0))}"
+        # The model is memory-mapped: it lives in the page cache, which the
+        # kernel counts as available, so show programs and cache separately.
+        self.bar(y + 2, 7, bw, (total - s.get("mem_free", 0)) / total, self.AMBER)
+        self.put(y + 2, 8 + bw, f"{human_bytes(s.get('mem_used', 0))} programs"
+                 f" + {human_bytes(s.get('mem_cached', 0))} cache of {human_bytes(total)}"
+                 f"  llama-server resident {human_bytes(s.get('llama_rss', 0))}"
                  f"  swap {human_bytes(s.get('swap_used', 0))}", self.c(self.TEXT))
         if "vram_total" in s:
             vt = s["vram_total"] or 1
