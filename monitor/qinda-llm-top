@@ -21,6 +21,7 @@ import locale
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -958,6 +959,9 @@ def main() -> int:
         return 0
     if args.console:
         console_setup()
+    # A service stop or tty hangup must still restore the console palette.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
     try:
         curses.wrapper(run, args, cfg)
     finally:
