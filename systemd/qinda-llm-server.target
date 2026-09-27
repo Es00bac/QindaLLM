@@ -1,0 +1,12 @@
+[Unit]
+Description=QindaQt LLM Server mode (coding model and its console, no desktop)
+Documentation=man:systemd.special(7)
+# Booted from the "LLM Server" row of the QindaQt boot menu
+# (systemd.unit=qinda-llm-server.target): everything multi-user.target
+# starts (network, Tailscale, SSH) plus the model server, with tty1 showing
+# qinda-llm-top instead of SDDM and the desktop.
+Requires=multi-user.target
+Wants=qinda-llm.service qinda-llm-monitor.service
+After=multi-user.target
+Conflicts=display-manager.service rescue.service rescue.target
+AllowIsolate=yes

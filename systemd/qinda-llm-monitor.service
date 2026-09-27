@@ -1,0 +1,19 @@
+[Unit]
+Description=QindaQt LLM Server console on tty1 (qinda-llm-top)
+After=qinda-llm.service systemd-user-sessions.service plymouth-quit-wait.service getty-pre.target
+Conflicts=getty@tty1.service
+
+[Service]
+# Runs as root: it reads the service journal and restarts the server on request.
+Type=idle
+ExecStart=/usr/bin/qinda-llm-top --console
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Environment=TERM=linux LANG=C.UTF-8
+LoadCredential=api-key:/etc/qinda-llm/api-key
+Restart=always
+RestartSec=1

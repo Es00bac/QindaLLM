@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""qinda-llm-top: live console for the QindaQt LLM Server (qinda-llm.service).
+
+Shows the loaded model and how it is placed on the machine, live prompt and
+generation speed, the slots, recent requests, and CPU, memory, GPU and
+network load. In LLM Server mode it runs on tty1 (qinda-llm-monitor.service);
+it also works in any terminal, e.g. `ssh qinda qinda-llm-top`.
+
+Keys: m load the other model   u unload   r restart the server
+      l log / dashboard        q quit (on tty1 the monitor restarts)
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import configparser
+import curses
+import json
+import locale
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ETC = Path(os.environ.get("QINDA_LLM_ETC", "/etc/qinda-llm"))
+SERVICE = "qinda-llm.service"
+HISTORY = 240                       # samples kept for the sparklines (1 per second)
+SPARK = " ▁▂▃▄▅▆▇█"
+
+# ------------------------------------------------------------------ config --
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return values
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        try:
+            values[key.strip()] = " ".join(shlex.split(value, comments=True))
+        except ValueError:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def read_presets(path: Path) -> dict[str, dict[str, str]]:
+    parser = configparser.ConfigParser(interpolation=None, strict=False,
+                                       inline_comment_prefixes=(";", "#"))
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    # Keys before the first section (version = 1) are not INI; give them one.
+    parser.read_string("[__top__]\n" + text)
+    shared = dict(parser["*"]) if parser.has_section("*") else {}
+    presets = {}
+    for name in parser.sections():
+        if name in ("__top__", "*"):
+            continue
+        merged = dict(shared)
+        merged.update(parser[name])
+        presets[name] = merged
+    return presets
+
+
+def read_api_key() -> str:
+    candidates = []
+    if os.environ.get("CREDENTIALS_DIRECTORY"):
+        candidates.append(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "api-key")
+    candidates += [ETC / "api-key", Path.home() / ".config/qinda-llm/api-key"]
+    if os.environ.get("QINDA_LLM_API_KEY"):
+        return os.environ["QINDA_LLM_API_KEY"].strip()
+    for path in candidates:
+        try:
+            return path.read_text().strip().splitlines()[0]
+        except (OSError, IndexError):
+            continue
+    return ""
+
+
+# -------------------------------------------------------------------- http --
+
+
+class Api:
+    def __init__(self, base: str, key: str) -> None:
+        self.base = base.rstrip("/")
+        self.key = key
+        self.error = ""
+
+    def _request(self, path: str, body: dict | None = None, timeout: float = 2.0) -> bytes | None:
+        req = urllib.request.Request(self.base + path)
+        if self.key:
+            req.add_header("Authorization", f"Bearer {self.key}")
+        if body is not None:
+            req.data = json.dumps(body).encode()
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                self.error = ""
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            self.error = f"HTTP {exc.code} on {path}"
+        except (urllib.error.URLError, OSError, socket.timeout) as exc:
+            reason = getattr(exc, "reason", exc)
+            self.error = f"{reason}"
+        return None
+
+    def json(self, path: str, body: dict | None = None, timeout: float = 2.0):
+        raw = self._request(path, body, timeout)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+
+    def text(self, path: str) -> str | None:
+        raw = self._request(path)
+        return raw.decode(errors="replace") if raw is not None else None
+
+
+def parse_metrics(text: str) -> dict[str, float]:
+    """Prometheus text exposition -> {name without llamacpp: prefix: value}."""
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0].split("{", 1)[0]
+        name = name.split(":", 1)[1] if ":" in name else name
+        try:
+            out[name] = float(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+def model_status(entry: dict) -> str:
+    status = entry.get("status")
+    if isinstance(status, dict):
+        return str(status.get("value", "unknown"))
+    return str(status or "unknown")
+
+
+# ----------------------------------------------------------------- journal --
+
+TIMING_PP = re.compile(r"prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens .*?([\d.]+) tokens per second")
+TIMING_TG = re.compile(r"^(?:.*?\s)?eval time =\s*([\d.]+) ms /\s*(\d+) tokens .*?([\d.]+) tokens per second")
+# The router forwards each model instance's output as "[<port>] <line>" and
+# announces "spawning server instance with name=<model> on port <port>".
+CHILD_TAG = re.compile(r"^\[\s*(\d+)\]\s")
+SPAWN = re.compile(r"spawning server instance with name=(\S+) on port (\d+)")
+LOAD_FACTS = [
+    ("layers", re.compile(r"offloaded (\d+)/(\d+) layers to GPU")),
+    ("gpu_buf", re.compile(r"(?:Vulkan0|ROCm0|CUDA0) model buffer size =\s*([\d.]+) MiB")),
+    ("cpu_buf", re.compile(r"CPU(?:_Mapped|_REPACK)? model buffer size =\s*([\d.]+) MiB")),
+    ("kv", re.compile(r"llama_kv_cache: .*size =\s*([\d.]+) MiB")),
+    ("n_cpu_moe", re.compile(r"n_cpu_moe\s*[=:]\s*(\d+)")),
+    ("fa", re.compile(r"flash_attn\s*=\s*(\w+)")),
+    ("graph_splits", re.compile(r"graph splits = (\d+)")),
+]
+
+
+@dataclass
+class Request:
+    when: str
+    model: str
+    prompt_tokens: int
+    prompt_ms: float
+    prompt_tps: float
+    gen_tokens: int = 0
+    gen_ms: float = 0.0
+    gen_tps: float = 0.0
+
+
+def parse_journal(lines: list[str]) -> tuple[list[Request], dict[str, str], list[str]]:
+    """Completed requests, model load facts and the log tail from journal lines."""
+    requests: list[Request] = []
+    facts: dict[str, str] = {}
+    pending: Request | None = None
+    ports: dict[str, str] = {}
+    for line in lines:
+        when = line[11:19] if len(line) > 19 and line[4] == "-" else ""
+        message = line.split("]: ", 1)[1] if "]: " in line else line
+        spawn = SPAWN.search(message)
+        if spawn:
+            ports[spawn.group(2)] = spawn.group(1)
+            facts = {}                     # a new instance: forget the old one's facts
+            continue
+        tag = CHILD_TAG.match(message)
+        model = ports.get(tag.group(1), "") if tag else ""
+        m = TIMING_PP.search(line)
+        if m:
+            pending = Request(when, model, int(m.group(2)), float(m.group(1)), float(m.group(3)))
+            continue
+        m = TIMING_TG.search(line)
+        if m and "prompt eval" not in line and pending is not None:
+            pending.gen_ms, pending.gen_tokens, pending.gen_tps = (
+                float(m.group(1)), int(m.group(2)), float(m.group(3)))
+            requests.append(pending)
+            pending = None
+            continue
+        if "load_tensors" in line or "llama_" in line or "fit" in line:
+            for key, rx in LOAD_FACTS:
+                fm = rx.search(line)
+                if fm:
+                    facts[key] = "/".join(fm.groups())
+    return requests, facts, lines[-400:]
+
+
+def journal(unit: str, lines: int = 1500) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["journalctl", "-u", unit, "-b", "-o", "short-iso", "--no-pager", "-n", str(lines)],
+            capture_output=True, text=True, timeout=4)
+        return out.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+
+# ------------------------------------------------------------------ system --
+
+
+def read(path: str | Path, default: str = "") -> str:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def hwmon(name: str) -> Path | None:
+    for d in Path("/sys/class/hwmon").glob("hwmon*"):
+        if read(d / "name") == name:
+            return d
+    return None
+
+
+class System:
+    def __init__(self) -> None:
+        self.prev_cpu: list[list[int]] | None = None
+        self.prev_net: tuple[float, int, int] | None = None
+        self.cpu_pct = 0.0
+        self.core_pct: list[float] = []
+        self.net_rx = self.net_tx = 0.0
+        self.gpu_dev = self._find_gpu()
+        self.k10 = hwmon("k10temp")
+        self.gpu_hwmon = next(iter((self.gpu_dev / "hwmon").glob("hwmon*")), None) if self.gpu_dev else None
+        self.net_if = "tailscale0" if Path("/sys/class/net/tailscale0").exists() else ""
+
+    @staticmethod
+    def _find_gpu() -> Path | None:
+        for card in sorted(Path("/sys/class/drm").glob("card[0-9]")):
+            dev = card / "device"
+            if (dev / "mem_info_vram_total").exists():
+                return dev
+        return None
+
+    def sample(self) -> dict:
+        s: dict = {}
+        stat = [l.split() for l in read("/proc/stat").splitlines() if l.startswith("cpu")]
+        cpus = [[int(v) for v in row[1:9]] for row in stat]
+        if self.prev_cpu and len(self.prev_cpu) == len(cpus):
+            pct = []
+            for old, new in zip(self.prev_cpu, cpus):
+                idle = (new[3] + new[4]) - (old[3] + old[4])
+                total = sum(new) - sum(old)
+                pct.append(100.0 * (1 - idle / total) if total > 0 else 0.0)
+            self.cpu_pct, self.core_pct = pct[0], pct[1:]
+        self.prev_cpu = cpus
+        s["cpu"] = self.cpu_pct
+        s["cores"] = self.core_pct
+        s["load"] = read("/proc/loadavg").split()[:3]
+        freqs = [int(read(p, "0")) for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_cur_freq")]
+        s["mhz"] = (sum(freqs) / len(freqs) / 1000) if freqs else 0
+        s["cpu_temp"] = int(read(self.k10 / "temp1_input", "0")) / 1000 if self.k10 else 0
+
+        mem = {}
+        for line in read("/proc/meminfo").splitlines():
+            key, _, rest = line.partition(":")
+            mem[key] = int(rest.split()[0]) * 1024 if rest.split() else 0
+        s["mem_total"] = mem.get("MemTotal", 0)
+        s["mem_used"] = mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)
+        s["mem_cached"] = mem.get("Cached", 0)
+        s["swap_used"] = mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)
+        s["llama_rss"] = self._llama_rss()
+
+        g = self.gpu_dev
+        if g:
+            s["gpu_busy"] = int(read(g / "gpu_busy_percent", "0") or 0)
+            s["vram_used"] = int(read(g / "mem_info_vram_used", "0") or 0)
+            s["vram_total"] = int(read(g / "mem_info_vram_total", "0") or 0)
+            s["gtt_used"] = int(read(g / "mem_info_gtt_used", "0") or 0)
+            s["sclk"] = self._dpm(g / "pp_dpm_sclk")
+            s["mclk"] = self._dpm(g / "pp_dpm_mclk")
+            h = self.gpu_hwmon
+            if h:
+                s["gpu_temp"] = int(read(h / "temp1_input", "0") or 0) / 1000
+                s["gpu_hot"] = int(read(h / "temp2_input", "0") or 0) / 1000
+                power = read(h / "power1_average") or read(h / "power1_input")
+                s["gpu_watts"] = int(power or 0) / 1e6
+                s["gpu_fan"] = int(read(h / "fan1_input", "0") or 0)
+            s["gpu_name"] = read(g / "product_name") or "GPU"
+
+        now = time.monotonic()
+        if self.net_if:
+            rx = int(read(f"/sys/class/net/{self.net_if}/statistics/rx_bytes", "0"))
+            tx = int(read(f"/sys/class/net/{self.net_if}/statistics/tx_bytes", "0"))
+            if self.prev_net:
+                dt = max(now - self.prev_net[0], 1e-3)
+                self.net_rx = (rx - self.prev_net[1]) / dt
+                self.net_tx = (tx - self.prev_net[2]) / dt
+            self.prev_net = (now, rx, tx)
+        s["net_if"], s["net_rx"], s["net_tx"] = self.net_if, self.net_rx, self.net_tx
+        s["uptime"] = float(read("/proc/uptime", "0").split()[0] or 0)
+        return s
+
+    @staticmethod
+    def _dpm(path: Path) -> str:
+        for line in read(path).splitlines():
+            if line.endswith("*"):
+                return line.split()[1]
+        return ""
+
+    @staticmethod
+    def _llama_rss() -> int:
+        total = 0
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                if (proc / "comm").read_text().strip() != "llama-server":
+                    continue
+                for line in (proc / "status").read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        total += int(line.split()[1]) * 1024
+            except OSError:
+                continue
+        return total
+
+
+def service_state() -> tuple[str, float]:
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", SERVICE, "-p", "ActiveState", "-p", "ActiveEnterTimestampMonotonic"],
+            capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", 0.0
+    props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    since = int(props.get("ActiveEnterTimestampMonotonic", "0") or 0) / 1e6
+    up = time.clock_gettime(time.CLOCK_MONOTONIC) - since if since else 0.0
+    return props.get("ActiveState", "unknown"), up
+
+
+# ------------------------------------------------------------------- state --
+
+
+@dataclass
+class SlotTrack:
+    task: int = -1
+    prompt_done: int = 0
+    decoded: int = 0
+    t: float = 0.0
+
+
+@dataclass
+class State:
+    models: list[dict] = field(default_factory=list)
+    active: str = ""
+    props: dict = field(default_factory=dict)
+    slots: list[dict] = field(default_factory=list)
+    metrics: dict[str, float] = field(default_factory=dict)
+    requests: list[Request] = field(default_factory=list)
+    facts: dict[str, str] = field(default_factory=dict)
+    log: list[str] = field(default_factory=list)
+    system: dict = field(default_factory=dict)
+    service: str = "unknown"
+    service_up: float = 0.0
+    pp_live: float = 0.0
+    tg_live: float = 0.0
+    pp_hist: collections.deque = field(default_factory=lambda: collections.deque(maxlen=HISTORY))
+    tg_hist: collections.deque = field(default_factory=lambda: collections.deque(maxlen=HISTORY))
+    tracks: dict[int, SlotTrack] = field(default_factory=dict)
+    note: str = ""
+    note_until: float = 0.0
+
+
+class Collector:
+    def __init__(self, api: Api) -> None:
+        self.api = api
+        self.system = System()
+        self.state = State()
+        self.last_journal = 0.0
+        self.last_service = 0.0
+
+    def poll(self) -> State:
+        st = self.state
+        now = time.monotonic()
+        st.system = self.system.sample()
+        if now - self.last_service > 2:
+            st.service, st.service_up = service_state()
+            self.last_service = now
+
+        listing = self.api.json("/models")
+        st.models = listing.get("data", []) if isinstance(listing, dict) else []
+        loaded = [m.get("id") for m in st.models if model_status(m) == "loaded"]
+        st.active = loaded[0] if loaded else ""
+        st.pp_live = st.tg_live = 0.0
+        if st.active:
+            q = "?model=" + urllib.request.quote(st.active)
+            st.props = self.api.json("/props" + q) or {}
+            slots = self.api.json("/slots" + q)
+            st.slots = slots if isinstance(slots, list) else []
+            text = self.api.text("/metrics" + q)
+            if text:
+                st.metrics = parse_metrics(text)
+            self._rates(now)
+        else:
+            st.props, st.slots = {}, []
+            st.tracks.clear()
+        st.pp_hist.append(st.pp_live)
+        st.tg_hist.append(st.tg_live)
+
+        if now - self.last_journal > 4:
+            st.requests, facts, st.log = parse_journal(journal(SERVICE))
+            st.facts = facts
+            self.last_journal = now
+        return st
+
+    def _rates(self, now: float) -> None:
+        st = self.state
+        for slot in st.slots:
+            sid = slot.get("id", 0)
+            nxt = (slot.get("next_token") or [{}])[0]
+            task = slot.get("id_task", -1)
+            done = int(slot.get("n_prompt_tokens_processed", 0) or 0)
+            decoded = int(nxt.get("n_decoded", 0) or 0)
+            tr = st.tracks.get(sid)
+            if tr and tr.task == task and slot.get("is_processing"):
+                dt = max(now - tr.t, 1e-3)
+                st.pp_live += max(0, done - tr.prompt_done) / dt
+                st.tg_live += max(0, decoded - tr.decoded) / dt
+            st.tracks[sid] = SlotTrack(task, done, decoded, now)
+
+
+# -------------------------------------------------------------------- draw --
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.1f} {unit}" if unit not in ("B", "KiB") else f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f}"
+
+
+def human_rate(n: float) -> str:
+    return human_bytes(n) + "/s"
+
+
+def human_time(seconds: float) -> str:
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m {s:02d}s"
+
+
+def sparkline(values, width: int, top: float | None = None) -> str:
+    vals = list(values)[-width:]
+    if not vals:
+        return ""
+    peak = top or max(max(vals), 1e-9)
+    out = []
+    for v in vals:
+        idx = 0 if v <= 0 else min(len(SPARK) - 1, 1 + int((v / peak) * (len(SPARK) - 2)))
+        out.append(SPARK[idx])
+    return "".join(out).rjust(width)
+
+
+# Palette for the Linux console, from the QindaQt "reclaimed" theme.
+CONSOLE_PALETTE = {
+    0: "162627", 1: "e0806e", 2: "bfd985", 3: "f2cb7d", 4: "7fb4c4", 5: "c4a3d6", 6: "53e3c4",
+    7: "c3cfb5", 8: "566953", 9: "f0a08e", 10: "d8ecae", 11: "f8dca4", 12: "a8d0dc",
+    13: "dcc2ea", 14: "8ff0da", 15: "f7faed",
+}
+
+
+class Ui:
+    ACCENT, AMBER, MUTED, TEXT, BORDER, BAD, HEAD, CYAN, GOOD = range(1, 10)
+
+    def __init__(self, scr, console: bool) -> None:
+        self.scr = scr
+        self.console = console
+        self.view = "dashboard"
+        curses.curs_set(0)
+        scr.nodelay(True)
+        scr.keypad(True)
+        curses.start_color()
+        bg = curses.COLOR_BLACK if console else -1
+        if not console:
+            curses.use_default_colors()
+        many = curses.COLORS >= 256 and not console
+        # The Linux console has 8 colours; bold selects the bright half of the
+        # palette console_setup() loads (8 = border green-grey, 15 = text).
+        self.extra = {self.TEXT: curses.A_BOLD, self.BORDER: curses.A_BOLD} if console else {}
+        pairs = {
+            self.ACCENT: (150 if many else curses.COLOR_GREEN, bg),
+            self.AMBER: (222 if many else curses.COLOR_YELLOW, bg),
+            self.MUTED: (151 if many else curses.COLOR_WHITE, bg),
+            self.TEXT: (255 if many else curses.COLOR_WHITE, bg),
+            self.BORDER: (65 if many else curses.COLOR_BLACK if console else curses.COLOR_GREEN, bg),
+            self.BAD: (174 if many else curses.COLOR_RED, bg),
+            self.HEAD: (curses.COLOR_BLACK if not many else 235, 150 if many else curses.COLOR_GREEN),
+            self.CYAN: (79 if many else curses.COLOR_CYAN, bg),
+            self.GOOD: (114 if many else curses.COLOR_GREEN, bg),
+        }
+        for pair, (fg, bgc) in pairs.items():
+            try:
+                curses.init_pair(pair, fg, bgc)
+            except curses.error:
+                curses.init_pair(pair, curses.COLOR_WHITE, -1 if not console else curses.COLOR_BLACK)
+        if console:
+            scr.bkgd(" ", curses.color_pair(self.TEXT))
+        self.utf8 = locale.getpreferredencoding(False).lower().replace("-", "") == "utf8"
+        self.right: int | None = None          # text clip column for the current panel
+
+    def c(self, pair: int, bold: bool = False) -> int:
+        if self.console and pair == self.HEAD:
+            bold = False                   # bold black would turn grey on the lime bar
+        return curses.color_pair(pair) | self.extra.get(pair, 0) | (curses.A_BOLD if bold else 0)
+
+    def put(self, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = self.scr.getmaxyx()
+        limit = w if self.right is None else min(w, self.right)
+        if y < 0 or y >= h or x >= limit:
+            return
+        text = text[: max(0, limit - x - (1 if y == h - 1 and limit == w else 0))]
+        if not self.utf8:
+            text = text.encode("ascii", "replace").decode()
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+    def box(self, y: int, x: int, h: int, w: int, title: str) -> None:
+        if h < 2 or w < 4:
+            return
+        self.right = None
+        hz, vt = ("─", "│") if self.utf8 else ("-", "|")
+        tl, tr, bl, br = ("╭", "╮", "╰", "╯") if self.utf8 else ("+", "+", "+", "+")
+        a = self.c(self.BORDER)
+        self.put(y, x, tl + hz * (w - 2) + tr, a)
+        for row in range(y + 1, y + h - 1):
+            self.put(row, x, vt, a)
+            self.put(row, x + w - 1, vt, a)
+        self.put(y + h - 1, x, bl + hz * (w - 2) + br, a)
+        self.put(y, x + 2, f" {title} ", self.c(self.ACCENT, True))
+        self.right = x + w - 1                 # panel contents stay inside the frame
+
+    def bar(self, y: int, x: int, width: int, frac: float, pair: int) -> None:
+        frac = max(0.0, min(1.0, frac))
+        if self.utf8:
+            eighths = int(round(frac * width * 8))
+            full, part = divmod(eighths, 8)
+            text = "█" * full + (" ▏▎▍▌▋▊▉"[part] if part else "")
+            self.put(y, x, text.ljust(width), self.c(pair))
+            self.put(y, x + len(text), "·" * max(0, width - len(text)), self.c(self.BORDER))
+        else:
+            full = int(round(frac * width))
+            self.put(y, x, "#" * full + "." * (width - full), self.c(pair))
+
+    # ------------------------------------------------------------ screens --
+    def draw(self, st: State, cfg: dict) -> None:
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        if h < 20 or w < 72:
+            self.put(0, 0, f"qinda-llm-top needs 72x20 (now {w}x{h})", self.c(self.BAD, True))
+            self.scr.refresh()
+            return
+        self.header(st, cfg, w)
+        if self.view == "log":
+            self.log_view(st, h, w)
+        else:
+            self.dashboard(st, cfg, h, w)
+        self.footer(st, h, w)
+        self.scr.refresh()
+
+    def header(self, st: State, cfg: dict, w: int) -> None:
+        self.right = None
+        a = self.c(self.HEAD, True)
+        self.put(0, 0, " " * w, a)
+        mark = "QQ" if not self.utf8 else "ǪQ"
+        left = f" {mark}  QindaQt LLM Server   {socket.gethostname()}   {cfg['url']}"
+        if st.service == "active" and not st.active:
+            state = "idle (no model loaded)"
+        elif st.service == "active":
+            state = f"● serving {st.active}"
+        else:
+            state = f"○ service {st.service}"
+        right = f"{state}   up {human_time(st.service_up)}   {time.strftime('%H:%M:%S')} "
+        self.put(0, 0, left, a)
+        self.put(0, max(len(left) + 2, w - len(right)), right, a)
+
+    def footer(self, st: State, h: int, w: int) -> None:
+        self.right = None
+        keys = " m model  u unload  r restart  l " + ("dashboard" if self.view == "log" else "log")
+        keys += "  q quit" + ("   Alt+F2 login shell" if self.console else "")
+        self.put(h - 1, 0, keys.ljust(w), self.c(self.MUTED))
+        if st.note and time.monotonic() < st.note_until:
+            self.put(h - 1, max(0, w - len(st.note) - 2), st.note, self.c(self.AMBER, True))
+
+    def dashboard(self, st: State, cfg: dict, h: int, w: int) -> None:
+        y = 2
+        # ------------------------------------------------------------ model --
+        preset = cfg["presets"].get(st.active, {})
+        model_h = 7
+        self.box(y, 0, model_h, w, "MODEL")
+        names = []
+        for m in st.models:
+            status = model_status(m)
+            mark = {"loaded": "●", "loading": "◐", "sleeping": "◌"}.get(status, "○")
+            names.append((f"{mark} {m.get('id')} ({status})",
+                          self.ACCENT if status == "loaded" else (self.AMBER if status == "loading" else self.MUTED)))
+        x = 2
+        for text, pair in names or [("server unreachable: " + (cfg["api"].error or "?"), self.BAD)]:
+            self.put(y + 1, x, text, self.c(pair, pair == self.ACCENT))
+            x += len(text) + 4
+        path = st.props.get("model_path") or preset.get("model", "")
+        size = ""
+        try:
+            size = human_bytes(Path(path).stat().st_size) if path else ""
+        except OSError:
+            pass
+        self.put(y + 2, 2, f"file   {Path(path).name if path else '-'}  {size}", self.c(self.TEXT))
+        n_ctx = st.props.get("n_ctx") or preset.get("ctx-size", "-")
+        slots_n = st.props.get("total_slots") or preset.get("parallel", "-")
+        kv = f"{preset.get('cache-type-k', 'f16')}/{preset.get('cache-type-v', 'f16')}"
+        layers = st.facts.get("layers", "").replace("/", " of ")
+        place = f"GPU layers {layers}" if layers else "GPU layers -"
+        if st.facts.get("n_cpu_moe"):
+            place += f" · experts of {st.facts['n_cpu_moe']} layers on CPU"
+        if st.facts.get("gpu_buf"):
+            place += f" · weights {float(st.facts['gpu_buf']) / 1024:.1f} GiB GPU"
+        if st.facts.get("cpu_buf"):
+            place += f" + {float(st.facts['cpu_buf']) / 1024:.1f} GiB CPU"
+        self.put(y + 3, 2, f"ctx    {n_ctx} tokens · {slots_n} slots · KV {kv}"
+                 + (f" ({float(st.facts['kv']):.0f} MiB)" if st.facts.get("kv") else ""), self.c(self.TEXT))
+        self.put(y + 4, 2, f"place  {place}", self.c(self.TEXT))
+        params = (st.props.get("default_generation_settings") or {}).get("params", {})
+        samp = []
+        for key, label in (("temperature", "temp"), ("top_p", "top-p"), ("top_k", "top-k"),
+                           ("min_p", "min-p"), ("presence_penalty", "presence"),
+                           ("repeat_penalty", "repeat")):
+            val = params.get(key, preset.get(label if label != "temp" else "temp"))
+            if val is not None:
+                samp.append(f"{label} {float(val):g}" if isinstance(val, (int, float)) or
+                            str(val).replace(".", "", 1).isdigit() else f"{label} {val}")
+        build = st.props.get("build_info", "")
+        self.put(y + 5, 2, "sample " + " · ".join(samp) + (f"   llama.cpp {build}" if build else ""),
+                 self.c(self.MUTED))
+        y += model_h
+
+        # -------------------------------------------------- speed and slots --
+        speed_h = 8
+        half = w // 2
+        self.box(y, 0, speed_h, half, "THROUGHPUT")
+        m = st.metrics
+        tg_avg = m.get("tokens_predicted_total", 0) / m["tokens_predicted_seconds_total"] \
+            if m.get("tokens_predicted_seconds_total") else 0.0
+        pp_avg = m.get("prompt_tokens_total", 0) / m["prompt_seconds_total"] \
+            if m.get("prompt_seconds_total") else 0.0
+        spark_w = max(10, half - 34)
+        self.put(y + 1, 2, "generate", self.c(self.MUTED))
+        self.put(y + 1, 12, f"{st.tg_live:7.1f} t/s", self.c(self.ACCENT, True))
+        self.put(y + 1, 26, sparkline(st.tg_hist, spark_w), self.c(self.ACCENT))
+        self.put(y + 2, 12, f"avg {tg_avg:6.1f} t/s", self.c(self.MUTED))
+        self.put(y + 3, 2, "prompt", self.c(self.MUTED))
+        self.put(y + 3, 12, f"{st.pp_live:7.0f} t/s", self.c(self.AMBER, True))
+        self.put(y + 3, 26, sparkline(st.pp_hist, spark_w), self.c(self.AMBER))
+        self.put(y + 4, 12, f"avg {pp_avg:6.0f} t/s", self.c(self.MUTED))
+        cached = m.get("prompt_tokens_cached_total", 0)
+        self.put(y + 5, 2, f"totals  {int(m.get('prompt_tokens_total', 0)):,} prompt"
+                 f" · {int(cached):,} cached · {int(m.get('tokens_predicted_total', 0)):,} generated",
+                 self.c(self.TEXT))
+        self.put(y + 6, 2, f"queue   {int(m.get('requests_processing', 0))} running"
+                 f" · {int(m.get('requests_deferred', 0))} waiting", self.c(self.TEXT))
+
+        self.box(y, half, speed_h, w - half, "SLOTS")
+        row = y + 1
+        for slot in st.slots[: speed_h - 2]:
+            sid = slot.get("id", 0)
+            busy = slot.get("is_processing")
+            nxt = (slot.get("next_token") or [{}])[0]
+            n_prompt = int(slot.get("n_prompt_tokens", 0) or 0)
+            done = int(slot.get("n_prompt_tokens_processed", 0) or 0)
+            cache = int(slot.get("n_prompt_tokens_cache", 0) or 0)
+            decoded = int(nxt.get("n_decoded", 0) or 0)
+            ctx = int(slot.get("n_ctx", 0) or 0)
+            if busy and decoded == 0 and n_prompt:
+                phase, pair = f"reading prompt {cache + done:,}/{n_prompt:,}", self.AMBER
+            elif busy:
+                phase, pair = f"generating {decoded:,} tokens", self.ACCENT
+            else:
+                phase, pair = "idle", self.MUTED
+            used = n_prompt + decoded
+            bw = max(8, (w - half) // 4)
+            ctx_x = w - bw - 17
+            self.right = ctx_x - 1 if ctx else w - 1
+            self.put(row, half + 2, f"#{sid} {'●' if busy else '○'} {phase}", self.c(pair, bool(busy)))
+            self.right = w - 1
+            if ctx:
+                self.put(row, ctx_x, f"{used:>8,}/{ctx // 1000}k", self.c(self.MUTED))
+                self.bar(row, w - bw - 3, bw, used / ctx, self.CYAN)
+            row += 1
+        if not st.slots:
+            self.put(row, half + 2, "no model loaded" if not st.active else "waiting for data", self.c(self.MUTED))
+        y += speed_h
+
+        # ------------------------------------------------------------ system --
+        s = st.system
+        sys_h = 7
+        self.box(y, 0, sys_h, w, "SYSTEM")
+        bw = max(10, min(40, w // 5))
+        load = " ".join(s.get("load", []))
+        self.put(y + 1, 2, "CPU", self.c(self.MUTED))
+        self.bar(y + 1, 7, bw, s.get("cpu", 0) / 100, self.ACCENT)
+        cores = s.get("cores", [])
+        cpu_text = (f"{s.get('cpu', 0):5.1f}%  load {load}  {s.get('mhz', 0):.0f} MHz"
+                    f"  {s.get('cpu_temp', 0):.0f}°C")
+        if cores and self.utf8 and w - 8 - bw - len(cpu_text) > len(cores) + 10:
+            per = "".join(SPARK[max(1, min(8, 1 + int(p / 12.5)))] for p in cores)
+            self.put(y + 1, w - len(per) - 9, "cores " + per, self.c(self.ACCENT))
+        self.put(y + 1, 8 + bw, cpu_text, self.c(self.TEXT))
+        total = s.get("mem_total", 1) or 1
+        self.put(y + 2, 2, "RAM", self.c(self.MUTED))
+        self.bar(y + 2, 7, bw, s.get("mem_used", 0) / total, self.AMBER)
+        self.put(y + 2, 8 + bw, f"{human_bytes(s.get('mem_used', 0))} of {human_bytes(total)}"
+                 f"  llama-server {human_bytes(s.get('llama_rss', 0))}"
+                 f"  page cache {human_bytes(s.get('mem_cached', 0))}"
+                 f"  swap {human_bytes(s.get('swap_used', 0))}", self.c(self.TEXT))
+        if "vram_total" in s:
+            vt = s["vram_total"] or 1
+            self.put(y + 3, 2, "GPU", self.c(self.MUTED))
+            self.bar(y + 3, 7, bw, s.get("gpu_busy", 0) / 100, self.ACCENT)
+            self.put(y + 3, 8 + bw, f"{s.get('gpu_busy', 0):3d}%  {s.get('sclk', '')} / mem {s.get('mclk', '')}"
+                     f"  {s.get('gpu_watts', 0):.0f} W  {s.get('gpu_temp', 0):.0f}°C"
+                     f" (hotspot {s.get('gpu_hot', 0):.0f}°C)  fan {s.get('gpu_fan', 0)} rpm",
+                     self.c(self.TEXT))
+            self.put(y + 4, 2, "VRAM", self.c(self.MUTED))
+            self.bar(y + 4, 7, bw, s.get("vram_used", 0) / vt, self.CYAN)
+            self.put(y + 4, 8 + bw, f"{human_bytes(s.get('vram_used', 0))} of {human_bytes(vt)}"
+                     f"  GTT {human_bytes(s.get('gtt_used', 0))}", self.c(self.TEXT))
+        net = (f"{s.get('net_if')}  ↓ {human_rate(s.get('net_rx', 0))}  ↑ {human_rate(s.get('net_tx', 0))}"
+               if s.get("net_if") else "no tailnet interface")
+        self.put(y + 5, 2, "NET", self.c(self.MUTED))
+        self.put(y + 5, 7, net + f"   system up {human_time(s.get('uptime', 0))}", self.c(self.TEXT))
+        y += sys_h
+
+        # ---------------------------------------------------------- requests --
+        req_h = h - 1 - y
+        if req_h >= 3:
+            self.box(y, 0, req_h, w, "RECENT REQUESTS")
+            self.put(y + 1, 2, f"{'time':8}  {'model':12} {'prompt':>9} {'read t/s':>9} {'read':>7}"
+                     f"   {'output':>7} {'gen t/s':>8} {'gen':>7}", self.c(self.MUTED))
+            rows = st.requests[-(req_h - 3):] if req_h > 3 else []
+            for i, r in enumerate(reversed(rows)):
+                self.put(y + 2 + i, 2,
+                         f"{r.when:8}  {r.model[:12]:12} {r.prompt_tokens:>9,} {r.prompt_tps:>9.1f}"
+                         f" {r.prompt_ms / 1000:>6.1f}s   {r.gen_tokens:>7,} {r.gen_tps:>8.1f}"
+                         f" {r.gen_ms / 1000:>6.1f}s", self.c(self.TEXT))
+            if not rows:
+                self.put(y + 2, 2, "no completed requests since boot", self.c(self.MUTED))
+
+    def log_view(self, st: State, h: int, w: int) -> None:
+        self.box(1, 0, h - 2, w, f"LOG  journalctl -u {SERVICE}")
+        lines = st.log[-(h - 4):]
+        for i, line in enumerate(lines):
+            pair = self.BAD if re.search(r"error|failed|fatal", line, re.I) else self.TEXT
+            self.put(2 + i, 2, line[: w - 4], self.c(pair))
+
+
+# ------------------------------------------------------------------ console --
+
+
+def console_setup() -> None:
+    """Big Terminus font sized to the framebuffer, and the QindaQt palette."""
+    size = read("/sys/class/graphics/fb0/virtual_size", "0,0").split(",")
+    try:
+        height = int(size[1])
+    except (IndexError, ValueError):
+        height = 0
+    font = "ter-v32b" if height >= 1600 else ("ter-v24b" if height >= 1000 else "ter-v16b")
+    try:
+        tty = os.ttyname(sys.stdout.fileno())
+    except OSError:
+        tty = "/dev/tty1"
+    subprocess.run(["setfont", "-C", tty, font], stderr=subprocess.DEVNULL, check=False)
+    sys.stdout.write("".join(f"\033]P{i:X}{rgb}" for i, rgb in CONSOLE_PALETTE.items()))
+    sys.stdout.write("\033[9;0]\033[14;0]")        # no console blanking or powerdown
+    sys.stdout.flush()
+
+
+def console_reset() -> None:
+    sys.stdout.write("\033]R")
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------- run --
+
+
+def load_config(url: str | None) -> dict:
+    env = read_env(ETC / "server.env")
+    host = env.get("QINDA_LLM_HOST", "127.0.0.1")
+    port = env.get("QINDA_LLM_PORT", "8100")
+    base = url or f"http://{host}:{port}"
+    return {"url": base, "presets": read_presets(ETC / "models.ini"),
+            "api": Api(base, read_api_key())}
+
+
+def act(key: int, st: State, cfg: dict) -> None:
+    api: Api = cfg["api"]
+    names = [m.get("id") for m in st.models] or list(cfg["presets"])
+    note = ""
+    if key in (ord("m"), ord("M")) and names:
+        idx = names.index(st.active) + 1 if st.active in names else 0
+        target = names[idx % len(names)]
+        api.json("/models/load", {"model": target}, timeout=5)
+        note = f"loading {target}…" if not api.error else f"load failed: {api.error}"
+    elif key in (ord("u"), ord("U")) and st.active:
+        api.json("/models/unload", {"model": st.active}, timeout=5)
+        note = f"unloading {st.active}" if not api.error else f"unload failed: {api.error}"
+    elif key in (ord("r"), ord("R")):
+        res = subprocess.run(["systemctl", "restart", "--no-block", SERVICE],
+                             capture_output=True, text=True)
+        note = "restarting the server" if res.returncode == 0 else "restart needs root"
+    if note:
+        st.note, st.note_until = note, time.monotonic() + 6
+
+
+def run(scr, args, cfg: dict) -> None:
+    ui = Ui(scr, args.console)
+    collector = Collector(cfg["api"])
+    next_poll = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= next_poll:
+            st = collector.poll()
+            ui.draw(st, cfg)
+            next_poll = now + args.interval
+        key = scr.getch()
+        if key == -1:
+            time.sleep(0.05)
+            continue
+        if key in (ord("q"), ord("Q")):
+            return
+        if key in (ord("l"), ord("L")):
+            ui.view = "dashboard" if ui.view == "log" else "log"
+            next_poll = 0
+        elif key == curses.KEY_RESIZE:
+            next_poll = 0
+        else:
+            act(key, collector.state, cfg)
+            next_poll = 0
+
+
+def snapshot(cfg: dict) -> str:
+    collector = Collector(cfg["api"])
+    collector.poll()
+    time.sleep(1)
+    st = collector.poll()
+    s = st.system
+    lines = [
+        f"server   {cfg['url']}  service {st.service}  model {st.active or '-'}",
+        f"live     generate {st.tg_live:.1f} t/s  prompt {st.pp_live:.0f} t/s",
+        f"cpu      {s.get('cpu', 0):.1f}%  load {' '.join(s.get('load', []))}",
+        f"ram      {human_bytes(s.get('mem_used', 0))} / {human_bytes(s.get('mem_total', 0))}",
+    ]
+    if "vram_total" in s:
+        lines.append(f"gpu      {s.get('gpu_busy', 0)}%  vram {human_bytes(s.get('vram_used', 0))}"
+                     f" / {human_bytes(s.get('vram_total', 0))}  {s.get('gpu_temp', 0):.0f}°C")
+    for r in st.requests[-5:]:
+        lines.append(f"request  {r.when} {r.model} prompt {r.prompt_tokens} @ {r.prompt_tps:.1f} t/s,"
+                     f" output {r.gen_tokens} @ {r.gen_tps:.1f} t/s")
+    if cfg["api"].error:
+        lines.append(f"api      {cfg['api'].error}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Live console for the QindaQt LLM Server.")
+    parser.add_argument("--url", help="server URL (default: from /etc/qinda-llm/server.env)")
+    parser.add_argument("--interval", type=float, default=1.0, help="refresh seconds (default 1)")
+    parser.add_argument("--console", action="store_true",
+                        help="Linux console mode: large font, QindaQt palette (tty1 service)")
+    parser.add_argument("--once", action="store_true", help="print one plain-text snapshot and exit")
+    args = parser.parse_args()
+    locale.setlocale(locale.LC_ALL, "")
+    cfg = load_config(args.url)
+    if args.once:
+        print(snapshot(cfg))
+        return 0
+    if args.console:
+        console_setup()
+    try:
+        curses.wrapper(run, args, cfg)
+    finally:
+        if args.console:
+            console_reset()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

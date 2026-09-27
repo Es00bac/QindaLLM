@@ -1,0 +1,35 @@
+[Unit]
+Description=QindaQt LLM Server (llama.cpp router for the /usr/share/gguf models)
+Documentation=file:///etc/qinda-llm/models.ini
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/qinda-llm/server.env
+# Router mode: each model in models.ini runs in its own child process, loaded
+# on demand; --models-max 1 because only one 35B model fits in 32 GB + 8 GB.
+# --metrics feeds qinda-llm-top; the children inherit these arguments.
+ExecStart=/usr/bin/llama-server \
+	--host ${QINDA_LLM_HOST} --port ${QINDA_LLM_PORT} \
+	--models-preset /etc/qinda-llm/models.ini --models-max 1 \
+	--api-key-file %d/api-key --metrics \
+	$QINDA_LLM_EXTRA_ARGS
+LoadCredential=api-key:/etc/qinda-llm/api-key
+# The listen address may not exist yet at boot (Tailscale); retry until it does.
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+DynamicUser=yes
+# RADV opens the render node; the shader cache and llama.cpp's cache need a home.
+SupplementaryGroups=video render
+CacheDirectory=qinda-llm
+Environment=HOME=/var/cache/qinda-llm XDG_CACHE_HOME=/var/cache/qinda-llm LLAMA_CACHE=/var/cache/qinda-llm/llama.cpp
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
