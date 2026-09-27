@@ -834,11 +834,18 @@ class Ui:
 
 def console_setup() -> None:
     """Big Terminus font sized to the framebuffer, and the QindaQt palette."""
-    size = read("/sys/class/graphics/fb0/virtual_size", "0,0").split(",")
-    try:
+    height = 0
+    size = read("/sys/class/graphics/fb0/virtual_size").split(",")
+    if len(size) == 2 and size[1].isdigit():
         height = int(size[1])
-    except (IndexError, ValueError):
-        height = 0
+    else:
+        # No fbdev node: the console runs at the connected display's
+        # preferred mode, the first line of its DRM mode list.
+        for conn in Path("/sys/class/drm").glob("card*-*"):
+            if read(conn / "status") == "connected":
+                first = read(conn / "modes").split("\n")[0]
+                if "x" in first:
+                    height = max(height, int(first.split("x")[1].rstrip("ip") or 0))
     font = "ter-v32b" if height >= 1600 else ("ter-v24b" if height >= 1000 else "ter-v16b")
     try:
         tty = os.ttyname(sys.stdout.fileno())
