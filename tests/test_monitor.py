@@ -43,8 +43,8 @@ class MonitorTest(unittest.TestCase):
 
     def test_presets_merge_defaults(self):
         presets = top.read_presets(ROOT / "config/models.ini")
-        self.assertEqual(set(presets), {"ornith", "qwen3.6"})
-        self.assertEqual(presets["qwen3.6"]["ctx-size"], "131072")
+        self.assertEqual(set(presets), {"ornith"})
+        self.assertEqual(presets["ornith"]["ctx-size"], "131072")
         self.assertTrue(presets["ornith"]["model"].endswith(".gguf"))
 
     def test_sparkline(self):

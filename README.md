@@ -21,8 +21,8 @@ the QindaGentoo overlay (models: `sci-ml/gguf-coding-models`, runtime:
 - Alongside the desktop: `systemctl start qinda-llm.service`; watch it with
   `sudo qinda-llm-top` (or `qinda-llm-top` with the key in
   `~/.config/qinda-llm/api-key`).
-- Clients send `"model": "ornith"` or `"qwen3.6"` (the sections of
-  `models.ini`); the router loads the requested model and unloads the other.
+- Clients send `"model": "ornith"` (a section of `models.ini`). With more
+  sections the router loads the requested model and unloads the other.
   OpenAI (`/v1/chat/completions`, `/v1/responses`) and Anthropic
   (`/v1/messages`) APIs are both served.
 
