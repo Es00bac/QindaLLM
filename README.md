@@ -43,3 +43,13 @@ the QindaQt palette for the Linux console.
 ```sh
 make test
 ```
+
+## License
+
+Original code authored for QindaLLM is released under the GNU General Public
+License, version 3 or (at your option) any later version
+(`GPL-3.0-or-later`). See [LICENSE](LICENSE) for the GPL version 3 text.
+
+This grant covers the original code in this repository. Model weights,
+llama.cpp, and other external components retain their own licenses and terms;
+they are not relicensed by these service and configuration sources.
